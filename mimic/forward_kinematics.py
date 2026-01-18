@@ -104,6 +104,9 @@ def main():
     if "qpos" not in data_in or "qvel" not in data_in:
         raise ValueError("Input npz must contain fields 'qpos' and 'qvel'")
 
+    # print('data_in: ', data_in.keys())
+    # print('data_in["qpos"]: ', data_in["qpos"].shape)
+    # print('data_in["qvel"]: ', data_in["qvel"].shape)
     qpos, qvel = data_in["qpos"], data_in["qvel"]
     fk = extract_fk_package(model, qpos, qvel)
 

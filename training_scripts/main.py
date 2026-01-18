@@ -7,7 +7,19 @@ from ddpg import DDPG_FF
 from training import training_loop
 
 ## Initialize the SAI client
-sai = SAIClient(comp_id="lower-t1-penalty-kick-goalie")
+# Option 1: Use environment variable (recommended)
+#   Set it in your shell: export SAI_API_KEY="your-api-key-here"
+#   Or add to ~/.bashrc: echo 'export SAI_API_KEY="your-api-key-here"' >> ~/.bashrc
+# Option 2: Pass directly (less secure, not recommended for production)
+#   sai = SAIClient(comp_id="cmp_xnSCxcJXQclQ", api_key="your-api-key-here")
+
+import os
+api_key = os.environ.get("SAI_API_KEY")
+if api_key:
+    sai = SAIClient(comp_id="cmp_xnSCxcJXQclQ", api_key=api_key)
+else:
+    # Will try to use default authentication if available
+    sai = SAIClient(comp_id="cmp_xnSCxcJXQclQ")
 
 ## Make the environment
 env = sai.make_env()
@@ -91,7 +103,7 @@ class Preprocessor():
 
 ## Create the model
 model = DDPG_FF(
-    n_features=87,  # type: ignore
+    n_features=89,  # type: ignore
     action_space=env.action_space,  # type: ignore
     neurons=[24, 12, 6],
     activation_function=F.relu,
@@ -112,7 +124,7 @@ def action_function(policy):
 
 
 ## Train the model
-training_loop(env, model, action_function, Preprocessor)
+training_loop(env, model, action_function, Preprocessor, timesteps=10000)
 
 ## Watch
 sai.watch(model, action_function, Preprocessor)

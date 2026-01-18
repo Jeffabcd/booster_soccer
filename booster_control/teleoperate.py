@@ -11,7 +11,7 @@ from t1_utils import LowerT1JoyStick
 
 def teleop(
     env_name: str = "LowerT1GoaliePenaltyKick-v0",
-    pos_sensitivity: float = 0.1,
+    pos_sensitivity: float = 1.5,
     rot_sensitivity: float = 1.5,
     renderer="mjviewer"
 ):
@@ -58,6 +58,7 @@ def teleop(
             
             command = keyboard_controller.advance()
             ctrl, _ = lower_t1_robot.get_actions(command, observation, info)
+            print('ctrl: ', ctrl)
             observation, reward, terminated, truncated, info = env.step(ctrl)
 
             if terminated or truncated:
@@ -73,7 +74,7 @@ def teleop(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Teleoperate T1 robot in a gymnasium environment.")
     parser.add_argument("--env", type=str, default="LowerT1GoaliePenaltyKick-v0", help="The environment to teleoperate.")
-    parser.add_argument("--pos_sensitivity", type=float, default=0.1, help="SE3 Keyboard position sensitivity.")
+    parser.add_argument("--pos_sensitivity", type=float, default=1.5, help="SE3 Keyboard position sensitivity.")
     parser.add_argument("--rot_sensitivity", type=float, default=0.5, help="SE3 Keyboard rotation sensitivity.")
     parser.add_argument("--renderer", type=str, default="mujoco", help="Which renderer to use.")
 

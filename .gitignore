@@ -210,3 +210,6 @@ __marimo__/
 /data/
 /aux/
 /imitation_learning/exp
+exp/
+out/
+diffusion_policy/data/

@@ -63,18 +63,36 @@ def main(args):
     lower_t1_robot = LowerT1JoyStick(env.unwrapped)
     preprocessor = Preprocessor()
     task_one_hot = get_task_one_hot(args.env_name)
-    observation, info = env.reset()
-    i = 0
-    while True:
-        preprocessed_observation = preprocessor.modify_state(observation.copy(), info.copy(), task_one_hot)
-        action = agent(observation=preprocessed_observation, temperature=0.0)
-        action = np.array(action)
-        i += 1
-        ctrl = lower_t1_robot.get_torque(observation, action)
-        observation, reward, terminated, truncated, info = env.step(ctrl)
+    return_list = []
+    success_list = []
+    step_count_list = []
+    for _ in range(args.eval_episodes):
+        observation, info = env.reset()
+        i = 0
+        total_reward = 0.0
+        while True:
+            preprocessed_observation = preprocessor.modify_state(observation.copy(), info.copy(), task_one_hot)
+            action = agent(observation=preprocessed_observation, temperature=0.0)
+            action = np.array(action)
+            # print(f"Observation stats: min={preprocessed_observation.min():.3f}, max={preprocessed_observation.max():.3f}, mean={preprocessed_observation.mean():.3f}")
+            # print(f"Action sequence shape: {action.shape}")
+            # print(f"Action stats: min={action.min():.6f}, max={action.max():.6f}, mean={action.mean():.6f}, std={action.std():.6f}")
+            i += 1
+            ctrl = lower_t1_robot.get_torque(observation, action)
+            observation, reward, terminated, truncated, info = env.step(ctrl)
+            total_reward += reward
+            if terminated or truncated:     
+                print('total_reward: ', total_reward)
+                return_list.append(total_reward)
+                success_list.append(info.get('success', False))
+                step_count_list.append(i)
+                break
 
-        if terminated or truncated:     
-            observation, info = env.reset()
+
+
+    print(f"Return list: {return_list}, mean: {np.mean(return_list)}, std: {np.std(return_list)}")
+    print(f"Step count list: {step_count_list}, mean: {np.mean(step_count_list)}, std: {np.std(step_count_list)}")
+    print(f"Success list: {success_list}, mean: {np.mean(success_list)}, std: {np.std(success_list)}")
 
 if __name__ == "__main__":
 
