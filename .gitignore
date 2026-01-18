@@ -213,3 +213,6 @@ __marimo__/
 exp/
 out/
 diffusion_policy/data/
+
+booster_dataset/
+booster_models/
