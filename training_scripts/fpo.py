@@ -1,9 +1,12 @@
 """
-PPO implementation with dedicated training loop for on-policy learning.
+FPO (Flow Matching Policy Optimization) implementation.
 Compatible with DDPG interface (forward, select_action, switch_to_test_mode).
+Uses DiffusionPolicy as actor and NeuralNetwork as critic.
 """
 
 import time
+from dataclasses import dataclass
+from typing import List, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -11,9 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.distributions import MultivariateNormal
 
-from network import NeuralNetwork
+from network import NeuralNetwork, DiffusionPolicy
 
 # Optional wandb import
 try:
@@ -22,10 +24,30 @@ except ImportError:
     wandb = None
 
 
-class PPO(torch.nn.Module):
+@dataclass
+class FpoActionInfo:
+    """
+    Container for additional information returned by the FPO actor.
+    """
+    x_t_path: torch.Tensor         # (*, flow_steps, action_dim)
+    loss_eps: torch.Tensor         # (*, sample_dim, action_dim)
+    loss_t: torch.Tensor           # (*, sample_dim, 1)
+    initial_cfm_loss: torch.Tensor # (*,)
+
+
+class FPO(torch.nn.Module):
+    """
+    Flow Matching Policy Optimization (FPO).
+    
+    - Actor: DiffusionPolicy (flow-matching policy)
+    - Critic: NeuralNetwork (standard value network)
+    - Uses PPO-style clipped objective, where the policy ratio is derived
+      from CFM loss differences instead of log-prob ratios.
+    """
+    
     def __init__(self, n_features, action_space, neurons, activation_function, learning_rate, **hyperparameters):
         """
-        PPO agent with separate actor / critic networks.
+        FPO agent with DiffusionPolicy actor and NeuralNetwork critic.
         Compatible with DDPG interface.
         
         Args:
@@ -34,7 +56,7 @@ class PPO(torch.nn.Module):
             neurons: List of hidden layer sizes
             activation_function: Activation function (e.g., F.relu)
             learning_rate: Learning rate
-            **hyperparameters: Additional PPO hyperparameters
+            **hyperparameters: Additional FPO hyperparameters
         """
         super().__init__()
         self.action_space = action_space
@@ -44,29 +66,48 @@ class PPO(torch.nn.Module):
         # Env info
         self.obs_dim = n_features
         self.act_dim = action_space.shape[0]
-
+        
         # Initialize hyperparameters
         self._init_hyperparameters(hyperparameters)
-
-        # Actor / Critic networks (using NeuralNetwork like DDPG)
-        shared_inputs = [neurons, activation_function]
-        self.actor = NeuralNetwork(
-            n_features,
-            action_space.shape[0],
-            *shared_inputs,
-            F.tanh,  # Tanh for bounded actions
+        
+        # Actor input dimension: observation + action + time
+        actor_input_dim = n_features + self.act_dim + 1
+        
+        # Actor: DiffusionPolicy
+        actor_kwargs = hyperparameters.get("actor_kwargs", {})
+        self.actor = DiffusionPolicy(
+            n_features=actor_input_dim,  # state + action + time
+            n_actions=self.act_dim,       # output is velocity (same dim as action)
+            neurons=neurons,
+            activation_function=activation_function,
+            state_dim=n_features,
+            action_dim=self.act_dim,
+            device=self.device,
+            num_steps=hyperparameters.get("num_steps", 10),
+            fixed_noise_inference=hyperparameters.get("fixed_noise_inference", False),
+            **actor_kwargs,
         ).to(self.device)
+        
+        # Critic: NeuralNetwork
         self.critic = NeuralNetwork(
-            n_features, 1, *shared_inputs
+            n_features,
+            1,  # value output
+            neurons,
+            activation_function,
         ).to(self.device)
-
+        
         # Optimizers
         self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate)
         self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
-
-        # Action distribution covariance
-        self.cov_var = torch.full(size=(self.act_dim,), fill_value=0.5)
-        self.cov_mat = torch.diag(self.cov_var).to(self.device)
+        
+        # FPO-specific hyperparameters
+        self.num_fpo_samples = hyperparameters.get("num_fpo_samples", 100)
+        self.positive_advantage = hyperparameters.get("positive_advantage", False)
+        
+        print(f"[FPO] Actor: DiffusionPolicy with {actor_input_dim} input dim")
+        print(f"[FPO] Critic: NeuralNetwork with {n_features} input dim")
+        print(f"[FPO] Training with {self.num_fpo_samples} CFM samples per state")
+        print(f"[FPO] positive_advantage = {self.positive_advantage}")
         
         # Logger
         self.logger = {
@@ -84,99 +125,114 @@ class PPO(torch.nn.Module):
     def switch_to_test_mode(self):
         """Move model to CPU for inference."""
         self.device = torch.device("cpu")
+        # Use eval() to ensure no gradient computation
+        self.eval()
         # Move all model parameters and buffers to CPU
         self.to("cpu")
         # Explicitly move submodules to ensure they're on CPU
+        self.actor.eval()
         self.actor.to("cpu")
+        # Update DiffusionPolicy's device attribute and move init_noise buffer
+        if hasattr(self.actor, 'device'):
+            self.actor.device = torch.device("cpu")
+        if hasattr(self.actor, 'init_noise'):
+            self.actor.init_noise = self.actor.init_noise.to("cpu")
+        
+        self.critic.eval()
         self.critic.to("cpu")
-        # Move covariance matrix buffer to CPU
-        if hasattr(self, 'cov_mat'):
-            self.cov_mat = self.cov_mat.to("cpu")
-        # Ensure all parameters are on CPU
+        
+        # Ensure all parameters and buffers are on CPU (double-check)
         for param in self.parameters():
             if param.is_cuda:
                 param.data = param.data.cpu()
         for buffer in self.buffers():
             if buffer.is_cuda:
                 buffer.data = buffer.data.cpu()
-
+        # Also check actor and critic parameters/buffers
+        for param in self.actor.parameters():
+            if param.is_cuda:
+                param.data = param.data.cpu()
+        for buffer in self.actor.buffers():
+            if buffer.is_cuda:
+                buffer.data = buffer.data.cpu()
+        for param in self.critic.parameters():
+            if param.is_cuda:
+                param.data = param.data.cpu()
+        for buffer in self.critic.buffers():
+            if buffer.is_cuda:
+                buffer.data = buffer.data.cpu()
 
     def forward(self, current_layer):
         """
-        Forward pass: returns mean action (deterministic).
+        Forward pass: returns deterministic action (mean of diffusion policy).
         Compatible with DDPG interface.
-        only used for testing
         """
         if isinstance(current_layer, np.ndarray):
             current_layer = torch.from_numpy(current_layer)
         
         # Handle shape: ensure it's 2D (batch, features)
         if len(current_layer.shape) > 2:
-            # Reshape from (1, 1, features) or similar to (1, features)
             current_layer = current_layer.reshape(current_layer.shape[0], -1)
         elif len(current_layer.shape) == 1:
-            # Add batch dimension: (features,) -> (1, features)
             current_layer = current_layer.unsqueeze(0)
         
+        # Move input to model's device (should be CPU after switch_to_test_mode)
         current_layer = current_layer.float().to(self.device)
-        action = self.actor.forward(current_layer)
-
+        # DiffusionPolicy's sample_action returns deterministic action
+        action = self.actor.sample_action(current_layer)
+        action = action.reshape(1, -1)
         return action
 
     def select_action(self, state):
         """
-        Sample an action from the current policy π(a|s).
-        Compatible with DDPG interface but returns action only (log_prob stored separately).
+        Sample an action from the FPO policy (deterministic).
+        Compatible with DDPG interface.
         """
         if isinstance(state, np.ndarray):
             state_tensor = torch.from_numpy(state).float().to(self.device)
         else:
             state_tensor = state.float().to(self.device)
-        mean = self.actor(state_tensor)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        action = dist.sample()
-        return action.detach().cpu().numpy()
+        
+        if len(state_tensor.shape) == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+        
+        with torch.no_grad():
+            action = self.actor.sample_action(state_tensor)
+        return action.detach().cpu().numpy().squeeze()
 
-    def get_action_with_log_prob(self, obs):
+    def get_action_with_info(self, obs):
         """
-        Get action and log_prob (used internally for on-policy collection).
-        Returns log_prob as a numpy scalar for storage in replay buffer.
+        Get action and FpoActionInfo (used internally for on-policy collection).
         """
         if isinstance(obs, np.ndarray):
             obs_tensor = torch.from_numpy(obs).float().to(self.device)
         else:
             obs_tensor = obs.float().to(self.device)
         
-        # Handle shape: ensure it's 2D (batch, features)
-        if len(obs_tensor.shape) > 2:
-            obs_tensor = obs_tensor.reshape(obs_tensor.shape[0], -1)
-        elif len(obs_tensor.shape) == 1:
+        if len(obs_tensor.shape) == 1:
             obs_tensor = obs_tensor.unsqueeze(0)
         
-        mean = self.actor(obs_tensor)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+        with torch.no_grad():
+            action, x_t_path, eps, t, initial_cfm_loss = self.actor.sample_action_with_info(
+                obs_tensor,
+                num_train_samples=self.num_fpo_samples,
+            )
         
-        # Return action and log_prob as numpy arrays
+        action_info = FpoActionInfo(
+            x_t_path=x_t_path,
+            loss_eps=eps,
+            loss_t=t,
+            initial_cfm_loss=initial_cfm_loss,
+        )
+        
         action_np = action.detach().cpu().numpy()
-        log_prob_np = log_prob.detach().cpu().numpy()
-        
-        # If single sample, squeeze to 1D action and scalar log_prob
         if len(action_np.shape) > 1:
             action_np = action_np.squeeze()
-        # Ensure log_prob is a scalar (float) for storage
-        if log_prob_np.size == 1:
-            log_prob_np = float(log_prob_np.item())
-        else:
-            log_prob_np = log_prob_np.squeeze()
-            if log_prob_np.size == 1:
-                log_prob_np = float(log_prob_np.item())
         
-        return action_np, log_prob_np
+        return action_np, action_info
 
     # ---------------------------------------------------------------------- #
-    #                        PPO Training Loop                               #
+    #                        FPO Training Loop                               #
     # ---------------------------------------------------------------------- #
 
     @staticmethod
@@ -186,36 +242,35 @@ class PPO(torch.nn.Module):
 
     def training_loop(self, env, action_function=None, preprocess_class=None, timesteps=1000):
         """
-        PPO training loop compatible with DDPG interface.
+        FPO training loop compatible with DDPG interface.
         
         Args:
             env: Gymnasium environment (single or vectorized)
-            action_function: Optional action transformation function (not used for PPO)
+            action_function: Optional action transformation function (not used for FPO)
             preprocess_class: Preprocessor class for state preprocessing
             timesteps: Total number of timesteps to train
         """
-        import gymnasium as gym
         from tqdm import tqdm
         
         preprocessor = preprocess_class() if preprocess_class else None
         is_vectorized = self._is_vectorized(env)
         num_envs = env.num_envs if is_vectorized else 1
         
-        print(f"PPO Training: {num_envs} environment(s), {timesteps} timesteps")
+        print(f"FPO Training: {num_envs} environment(s), {timesteps} timesteps")
         print(f"Batch size: {self.timesteps_per_batch}, Max episode length: {self.max_timesteps_per_episode}")
         
         total_steps = 0
         iteration = 0
-        pbar = tqdm(total=timesteps, desc="PPO Training", unit="steps")
+        pbar = tqdm(total=timesteps, desc="FPO Training", unit="steps")
         
         while total_steps < timesteps:
             # ------------------------------------------------------------------
-            # 1. Rollout: collect on-policy data
+            # 1. Rollout: collect on-policy data with CFM info
             # ------------------------------------------------------------------
             (
                 batch_obs,
                 batch_acts,
-                batch_log_probs,
+                batch_action_info,
                 batch_rews,
                 batch_lens,
                 batch_vals,
@@ -227,11 +282,6 @@ class PPO(torch.nn.Module):
                 
             batch_obs = batch_obs.to(self.device)
             batch_acts = batch_acts.to(self.device)
-            batch_log_probs = batch_log_probs.to(self.device)
-            # print(f"Batch rews: {np.array(batch_rews).shape}")
-            # print(f"Batch lens: {np.array(batch_lens).shape}")
-            # print(f"Batch vals: {np.array(batch_vals).shape}")
-            # print(f"Batch dones: {np.array(batch_dones).shape}")
             
             # ------------------------------------------------------------------
             # 2. GAE Advantage + target values
@@ -241,7 +291,6 @@ class PPO(torch.nn.Module):
                 values = self.critic(batch_obs).squeeze()
             
             # Flatten episode data to match batch_obs structure
-            # batch_obs contains observations in order, so we need to match that
             flat_rews = []
             flat_vals = []
             flat_dones = []
@@ -250,28 +299,6 @@ class PPO(torch.nn.Module):
                 flat_rews.extend(ep_rews)
                 flat_vals.extend(ep_vals)
                 flat_dones.extend(ep_dones)
-
-            
-            # Check if sizes match - if not, trim batch_obs to match episode data
-            # This can happen if we collected observations beyond episode boundaries
-            # if len(flat_rews) != batch_obs.size(0):
-            #     # Trim batch_obs, batch_acts, batch_log_probs to match episode data length
-            #     expected_len = len(flat_rews)
-            #     if expected_len < batch_obs.size(0):
-            #         batch_obs = batch_obs[:expected_len]
-            #         batch_acts = batch_acts[:expected_len]
-            #         batch_log_probs = batch_log_probs[:expected_len]
-            #         # Recompute values for trimmed observations
-            #         with torch.no_grad():
-            #             values = self.critic(batch_obs).squeeze()
-            #     else:
-            #         # This shouldn't happen, but handle it
-            #         print(f"Warning: More episode data ({expected_len}) than observations ({batch_obs.size(0)})")
-            #         # Pad with zeros (not ideal, but prevents crash)
-            #         pad_len = expected_len - batch_obs.size(0)
-            #         flat_rews = flat_rews[:batch_obs.size(0)]
-            #         flat_vals = flat_vals[:batch_obs.size(0)]
-            #         flat_dones = flat_dones[:batch_obs.size(0)]
             
             # Convert to tensors
             flat_rews = torch.tensor(flat_rews, dtype=torch.float32).to(self.device)
@@ -285,14 +312,12 @@ class PPO(torch.nn.Module):
             # Process backwards through the flattened data
             for t in reversed(range(len(flat_rews))):
                 if t + 1 < len(flat_rews):
-                    # Not the last timestep
                     delta = (
                         flat_rews[t]
                         + self.gamma * flat_vals_tensor[t + 1] * (1 - flat_dones[t + 1])
                         - flat_vals_tensor[t]
                     )
                 else:
-                    # Last timestep
                     delta = flat_rews[t] - flat_vals_tensor[t]
                 
                 # GAE: A_t = δ_t + (γλ)(1 - done_t) * A_{t+1}
@@ -307,18 +332,19 @@ class PPO(torch.nn.Module):
             self.logger["t_so_far"] = total_steps
             self.logger["i_so_far"] = iteration
             
-            # Normalize advantages (stabilizes training)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
+            # Normalize advantages
+            if self.positive_advantage:
+                advantages = F.softplus(advantages)
+            else:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
             
             # ------------------------------------------------------------------
-            # 3. PPO update (mini-batch SGD for several epochs)
+            # 3. FPO update (mini-batch SGD for several epochs)
             # ------------------------------------------------------------------
-
             num_steps = batch_obs.size(0)
             indices = np.arange(num_steps)
             minibatch_size = max(num_steps // self.num_minibatches, 1)
             epoch_actor_losses = []
-            approx_kl = 0.0
             
             for _ in range(self.n_updates_per_iteration):
                 # Learning rate annealing
@@ -338,29 +364,60 @@ class PPO(torch.nn.Module):
                     
                     mb_obs = batch_obs[mb_idx]
                     mb_acts = batch_acts[mb_idx]
-                    mb_log_probs_old = batch_log_probs[mb_idx]
                     mb_adv = advantages[mb_idx]
                     mb_rtgs = batch_rtgs[mb_idx]
+                    mb_infos = [batch_action_info[i] for i in mb_idx]
                     
-                    # Forward pass: evaluate V(s), log π(a|s), entropy
-                    V_pred, log_probs_new, entropy = self.evaluate(mb_obs, mb_acts)
+                    # Extract CFM-related tensors
+                    loss_eps = torch.stack([info.loss_eps for info in mb_infos]).to(self.device)  # [B, N, act_dim]
+                    loss_t = torch.stack([info.loss_t for info in mb_infos]).to(self.device)        # [B, N, 1]
+                    initial_cfm_loss = torch.stack([info.initial_cfm_loss for info in mb_infos]).to(self.device)  # [B, N]
                     
-                    # PPO clipped surrogate objective
-                    log_ratio = log_probs_new - mb_log_probs_old
-                    ratio = torch.exp(log_ratio)
+                    # Critic prediction
+                    V_pred = self.critic(mb_obs).squeeze()
                     
-                    # Compute approximate KL divergence for early stopping
-                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    # Compute CFM loss difference
+                    B, N, D = loss_eps.shape
                     
-                    # Compute the clipped surrogate objective
-                    surr1 = ratio * mb_adv
-                    surr2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * mb_adv
-                    actor_loss = -torch.min(surr1, surr2).mean()
+                    # Repeat observations and actions across N samples
+                    flat_obs = mb_obs.unsqueeze(1).repeat(1, N, 1).view(B * N, -1)   # [B*N, obs_dim]
+                    flat_acts = mb_acts.unsqueeze(1).repeat(1, N, 1).view(B * N, -1) # [B*N, act_dim]
                     
-                    # Add entropy bonus (to encourage exploration)
-                    actor_loss -= self.ent_coef * entropy.mean()
+                    # Flatten eps, t, and initial_cfm_loss
+                    flat_eps = loss_eps.view(B * N, -1)                                 # [B*N, act_dim]
+                    flat_t = loss_t.view(B * N, -1)                                     # [B*N, 1]
+                    flat_init_loss = initial_cfm_loss.view(B * N)                       # [B*N]
                     
-                    # Compute value function loss (critic_loss) using MSE
+                    # Compute the new CFM loss with current actor
+                    # DiffusionPolicy.compute_cfm_loss expects: (state_norm, x1, eps, t)
+                    # where state_norm is the observation, x1 is the action, eps is noise, t is time
+                    cfm_loss = self.actor.compute_cfm_loss(
+                        flat_obs,  # state_norm: [B*N, obs_dim]
+                        flat_acts, # x1: [B*N, act_dim] - final action
+                        flat_eps,  # eps: [B*N, act_dim] - noise
+                        flat_t,    # t: [B*N, 1] - time
+                    )  # [B*N]
+                    
+                    # Compute per-sample CFM loss difference and reshape to [B, N]
+                    diff = flat_init_loss - cfm_loss
+                    cfm_difference = diff.view(B, N)
+                    
+                    # Build state-wise policy ratio rho_s from CFM diff
+                    cfm_difference = torch.clamp(cfm_difference, -3.0, 3.0)
+                    delta_s = cfm_difference.mean(dim=1)  # [B]
+                    delta_s = torch.clamp(delta_s, -3.0, 3.0)
+                    rho_s = torch.exp(delta_s)  # [B]
+                    
+                    # PPO-style clipped surrogate objective with rho_s
+                    surr1 = rho_s * mb_adv
+                    surr2 = torch.clamp(rho_s, 1 - self.clip, 1 + self.clip) * mb_adv
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Actor loss (no entropy for FPO, but keep structure)
+                    entropy = torch.tensor(0.0, device=self.device)
+                    actor_loss = policy_loss - self.ent_coef * entropy.mean()
+                    
+                    # Critic loss
                     critic_loss = nn.MSELoss()(V_pred, mb_rtgs)
                     
                     # Backward: actor
@@ -376,10 +433,16 @@ class PPO(torch.nn.Module):
                     self.critic_optim.step()
                     
                     epoch_actor_losses.append(actor_loss.detach())
-                
-                # Early stop if KL too large
-                if approx_kl > self.target_kl:
-                    break
+                    
+                    # Logging
+                    if wandb is not None:
+                        wandb.log({
+                            "cfm_difference": cfm_difference.mean().item(),
+                            "policy_ratio_mean": rho_s.mean().item(),
+                            "policy_loss": policy_loss.item(),
+                            "actor_loss": actor_loss.item(),
+                            "critic_loss": critic_loss.item(),
+                        })
             
             # ------------------------------------------------------------------
             # 4. Logging
@@ -389,34 +452,35 @@ class PPO(torch.nn.Module):
             self.logger["batch_rews"] = batch_rews
             self.logger["batch_lens"] = batch_lens
             
-            # Update progress bar with timing info
             avg_ep_ret = np.mean([np.sum(ep_rews) for ep_rews in batch_rews])
             avg_ep_len = np.mean(batch_lens)
             pbar.update(np.sum(batch_lens))
             pbar.set_description(
                 f"Iter {iteration} | Steps: {total_steps}/{timesteps} | "
                 f"Return: {avg_ep_ret:.2f} | Len: {avg_ep_len:.1f} | "
-                f"Loss: {avg_actor_loss:.4f} | "
-
+                f"Loss: {avg_actor_loss:.4f}"
             )
             
             if wandb is not None:
-                wandb.log({"advantage_hist": wandb.Histogram(advantages.cpu().numpy())})
-                wandb.log({"actor_loss": avg_actor_loss})
-                wandb.log({"Return": avg_ep_ret})
+                wandb.log({
+                    "advantage_hist": wandb.Histogram(advantages.cpu().numpy()),
+                    "actor_loss": avg_actor_loss,
+                    "Return": avg_ep_ret,
+                })
         
         pbar.close()
         env.close()
-        print(f"PPO Training completed: {total_steps} timesteps, {iteration} iterations")
+        print(f"FPO Training completed: {total_steps} timesteps, {iteration} iterations")
 
     def _rollout_with_preprocessor(self, env, preprocessor, is_vectorized, num_envs):
         """
         Collect one batch of on-policy data with preprocessor support.
         Handles both single and vectorized environments.
+        Returns action_info for FPO.
         """
         batch_obs = []
         batch_acts = []
-        batch_log_probs = []
+        batch_action_info = []
         batch_rews = []
         batch_lens = []
         batch_vals = []
@@ -453,25 +517,22 @@ class PPO(torch.nn.Module):
         while t < self.timesteps_per_batch:
             if is_vectorized:
                 # Vectorized: collect from all environments in parallel
-                # Get actions for all environments
                 actions = []
-                step_data = []  # Store (env_idx, obs, action, log_prob, value) for non-done envs
+                step_data = []
                 
                 for i in range(num_envs):
                     if env_dones[i]:
-                        # Use zero action for done envs (will be reset after step)
                         actions.append(np.zeros(self.act_dim))
                     else:
                         obs = env_obs[i]
-                        action, log_prob = self.get_action_with_log_prob(obs)
+                        action, action_info = self.get_action_with_info(obs)
                         obs_tensor = torch.tensor(obs, dtype=torch.float32).to(self.device)
                         if len(obs_tensor.shape) == 1:
                             obs_tensor = obs_tensor.unsqueeze(0)
                         value = self.critic(obs_tensor).detach().squeeze()
                         
                         actions.append(action)
-                        # Store step data - we'll add to batch after we get rewards
-                        step_data.append((i, obs, action, log_prob, value.item()))
+                        step_data.append((i, obs, action, action_info, value.item()))
                 
                 # Step all environments
                 actions_array = np.array(actions)
@@ -491,12 +552,10 @@ class PPO(torch.nn.Module):
                 else:
                     next_states = next_observations
                 
-                # Process step data and update environments
-                # Only process environments that actually took a step (non-done)
+                # Process step data
                 step_idx = 0
                 for i in range(num_envs):
                     if env_dones[i]:
-                        # Done env was reset by vectorized env - skip processing
                         env_obs[i] = next_states[i]
                         env_dones[i] = False
                         env_ep_rews[i] = []
@@ -504,31 +563,27 @@ class PPO(torch.nn.Module):
                         env_ep_dones[i] = []
                         env_ep_lens[i] = 0
                     else:
-                        # This environment took a step
-                        env_idx, obs, action, log_prob, value = step_data[step_idx]
+                        env_idx, obs, action, action_info, value = step_data[step_idx]
                         rew = rewards[i]
                         done = dones[i]
                         
-                        # Store data for this step (observation BEFORE step, reward AFTER step)
                         batch_obs.append(obs)
                         batch_acts.append(action)
-                        batch_log_probs.append(log_prob)
+                        batch_action_info.append(action_info)
                         env_ep_rews[i].append(rew)
                         env_ep_vals[i].append(value)
-                        env_ep_dones[i].append(env_dones[i])  # done flag BEFORE this step
+                        env_ep_dones[i].append(env_dones[i])
                         env_ep_lens[i] += 1
                         t += 1
                         step_idx += 1
                         
                         if done:
                             env_dones[i] = True
-                            # Episode ended - store episode data
                             batch_lens.append(env_ep_lens[i])
                             batch_rews.append(env_ep_rews[i])
                             batch_vals.append(env_ep_vals[i])
                             batch_dones.append(env_ep_dones[i])
                             
-                            # Reset this environment
                             env_obs[i] = next_states[i]
                             env_dones[i] = False
                             env_ep_rews[i] = []
@@ -562,8 +617,8 @@ class PPO(torch.nn.Module):
                     t += 1
                     batch_obs.append(obs)
                     
-                    # Get action and log_prob
-                    action, log_prob = self.get_action_with_log_prob(obs)
+                    # Get action and action_info
+                    action, action_info = self.get_action_with_info(obs)
                     obs_tensor = torch.tensor(obs, dtype=torch.float32).to(self.device)
                     if len(obs_tensor.shape) == 1:
                         obs_tensor = obs_tensor.unsqueeze(0)
@@ -593,7 +648,7 @@ class PPO(torch.nn.Module):
                     ep_rews.append(rew)
                     ep_vals.append(value.item())
                     batch_acts.append(action)
-                    batch_log_probs.append(log_prob)
+                    batch_action_info.append(action_info)
                     
                     obs = next_obs
                     
@@ -605,12 +660,10 @@ class PPO(torch.nn.Module):
                 batch_vals.append(ep_vals)
                 batch_dones.append(ep_dones)
         
-        # Handle ongoing episodes in vectorized case - store their data even if not ended
-        # This ensures we don't lose data from ongoing episodes at the batch boundary
+        # Handle ongoing episodes in vectorized case
         if is_vectorized:
             for i in range(num_envs):
                 if not env_dones[i] and len(env_ep_rews[i]) > 0:
-                    # Episode is still ongoing but has data - store it
                     batch_lens.append(env_ep_lens[i])
                     batch_rews.append(env_ep_rews[i])
                     batch_vals.append(env_ep_vals[i])
@@ -620,7 +673,7 @@ class PPO(torch.nn.Module):
             return (
                 torch.tensor([], dtype=torch.float32),
                 torch.tensor([], dtype=torch.float32),
-                torch.tensor([], dtype=torch.float32),
+                [],
                 [],
                 [],
                 [],
@@ -629,67 +682,16 @@ class PPO(torch.nn.Module):
         
         batch_obs = torch.tensor(np.array(batch_obs), dtype=torch.float32)
         batch_acts = torch.tensor(np.array(batch_acts), dtype=torch.float32)
-        batch_log_probs = torch.tensor(np.array(batch_log_probs), dtype=torch.float32)
         
         return (
             batch_obs,
             batch_acts,
-            batch_log_probs,
+            batch_action_info,
             batch_rews,
             batch_lens,
             batch_vals,
             batch_dones,
         )
-
-    # ---------------------------------------------------------------------- #
-    #                        Original PPO methods (kept for reference)       #
-    # ---------------------------------------------------------------------- #
-    #                          GAE Calculation                               #
-    # ---------------------------------------------------------------------- #
-
-    def calculate_gae(self, rewards, values, dones):
-        """
-        Compute Generalized Advantage Estimation (GAE) over a batch of episodes.
-        """
-        all_advantages = []
-
-        for ep_rews, ep_vals, ep_dones in zip(rewards, values, dones):
-            advantages = []
-            last_advantage = 0.0
-
-            # backward through episode
-            for t in reversed(range(len(ep_rews))):
-                if t + 1 < len(ep_rews):
-                    delta = (
-                        ep_rews[t]
-                        + self.gamma * ep_vals[t + 1] * (1 - ep_dones[t + 1])
-                        - ep_vals[t]
-                    )
-                else:
-                    delta = ep_rews[t] - ep_vals[t]
-
-                adv = delta + self.gamma * self.lam * (1 - ep_dones[t]) * last_advantage
-                last_advantage = adv
-                advantages.insert(0, adv)
-
-            all_advantages.extend(advantages)
-
-        return torch.tensor(all_advantages, dtype=torch.float32)
-
-    def evaluate(self, batch_obs, batch_acts):
-        """
-        Given a batch of (s, a), compute:
-        - V(s)
-        - log π(a|s)
-        - entropy[π(·|s)]
-        """
-        values = self.critic(batch_obs).squeeze()
-
-        mean = self.actor(batch_obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        log_probs = dist.log_prob(batch_acts)
-
-        return values, log_probs, dist.entropy()
 
     # ---------------------------------------------------------------------- #
     #                        Hyperparameters & Logging                       #
@@ -699,7 +701,7 @@ class PPO(torch.nn.Module):
         """
         Set default hyperparameters and override with user-provided values.
         """
-        # Core PPO hyperparameters
+        # Core FPO hyperparameters (similar to PPO)
         self.timesteps_per_batch = 2000
         self.max_timesteps_per_episode = 600
         self.n_updates_per_iteration = 1
@@ -710,16 +712,14 @@ class PPO(torch.nn.Module):
         self.lam = 0.98
         self.num_minibatches = 6
         self.ent_coef = 0.0
-        self.target_kl = 0.02
         self.max_grad_norm = 0.5
-        self.deterministic = False
 
         # Misc
-        self.render = True
+        self.render = False
         self.render_every_i = 10
         self.save_freq = 10
         self.seed = None
-        self.run_name = "unnamed_run"
+        self.run_name = "fpo_run"
 
         # Override defaults
         for param, val in hyperparameters.items():
@@ -729,4 +729,3 @@ class PPO(torch.nn.Module):
             assert isinstance(self.seed, int)
             torch.manual_seed(self.seed)
             print(f"Successfully set seed to {self.seed}")
-

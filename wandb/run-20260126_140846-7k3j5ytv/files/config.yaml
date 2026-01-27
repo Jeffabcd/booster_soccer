@@ -1,0 +1,65 @@
+_wandb:
+    value:
+        cli_version: 0.24.0
+        e:
+            w0did9theg6fr6k4qmmf32uixu5ezr7o:
+                args:
+                    - --alg
+                    - ppo
+                    - --timesteps
+                    - "100000"
+                    - --num_envs
+                    - "4"
+                codePath: training_scripts/main.py
+                codePathLocal: training_scripts/main.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "979610439680"
+                        used: "240409169920"
+                email: jeffjeff050260612@gmail.com
+                executable: /mnt/home/fang/anaconda3/envs/booster-ssl/bin/python
+                git:
+                    commit: 2f6dd84f8ec84a59267c2357c2a0f9705ad26d4a
+                    remote: https://github.com/Jeffabcd/booster_soccer.git
+                gpu: NVIDIA GeForce RTX 5090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 21760
+                      memoryTotal: "34190917632"
+                      name: NVIDIA GeForce RTX 5090
+                      uuid: GPU-4597de51-06ca-2d01-842b-585fa442262c
+                host: lab544-desktop5
+                memory:
+                    total: "132589735936"
+                os: Linux-6.8.0-58-generic-x86_64-with-glibc2.39
+                program: /mnt/home/fang/booster_soccer_showdown/training_scripts/main.py
+                python: CPython 3.11.14
+                root: /mnt/home/fang/booster_soccer_showdown
+                startedAt: "2026-01-26T14:08:46.927288Z"
+                writerId: w0did9theg6fr6k4qmmf32uixu5ezr7o
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+            "4": 3.11.14
+            "5": 0.24.0
+            "8":
+                - 2
+            "12": 0.24.0
+            "13": linux-x86_64
+alg:
+    value: ppo
+num_envs:
+    value: 4
+timesteps:
+    value: 100000

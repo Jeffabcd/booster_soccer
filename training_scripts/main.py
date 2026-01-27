@@ -1,14 +1,17 @@
+import torch
 import torch.nn.functional as F
 import numpy as np
 import sys
 import os
+from datetime import datetime
 
 from sai_rl import SAIClient
 
 from ddpg import DDPG_FF
 from training import training_loop
 from ppo import PPO
-
+from fpo import FPO
+import wandb
 import argparse
 
 # Use gymnasium's built-in vector environments
@@ -40,8 +43,8 @@ num_envs = int(os.environ.get("NUM_ENVS", "1"))
 parser = argparse.ArgumentParser(description='Train RL agent (DDPG or PPO)')
 
 # Algorithm selection
-parser.add_argument('--alg', type=str, default='ppo', choices=['ppo', 'ddpg'],
-                    help='Algorithm to use: ppo or ddpg (default: ppo)')
+parser.add_argument('--alg', type=str, default='ppo', choices=['ppo', 'ddpg', 'fpo'],
+                    help='Algorithm to use: ppo, ddpg, or fpo (default: ppo)')
 
 # Training parameters
 parser.add_argument('--timesteps', type=int, default=1000,
@@ -202,7 +205,7 @@ class Preprocessor():
 
 ## Create the model
 if args.alg == 'ddpg':
-# Use single_action_space (not vectorized) for model creation
+    # Use single_action_space (not vectorized) for model creation
     model = DDPG_FF(
         n_features=89,  # type: ignore
         action_space=single_action_space,  # type: ignore - use single env action space
@@ -217,6 +220,17 @@ elif args.alg == 'ppo':
         neurons=[24, 12, 6],
         activation_function=F.relu,
         learning_rate=0.0001,
+    )
+elif args.alg == 'fpo':
+    model = FPO(
+        n_features=89,
+        action_space=single_action_space,
+        neurons=[24, 12, 6],
+        activation_function=F.relu,
+        learning_rate=0.0001,
+        num_fpo_samples=100,
+        num_steps=10,
+        positive_advantage=False,
     )
 
 ## Define an action function
@@ -244,17 +258,39 @@ def action_function(policy):
         + (action_high - action_low) * bounded_percent
     )
 
+wandb.init(
+    project='booster_soccer_rl',
+    name=f"{args.alg}_{args.timesteps}",
+    config=args,
+)
+
 ## Train the model
-# Use PPO's own training_loop for on-policy learning
-if isinstance(model, PPO):
+# Use algorithm-specific training_loop for on-policy learning (PPO, FPO)
+if isinstance(model, (PPO, FPO)):
     model.training_loop(env, action_function, Preprocessor, timesteps=args.timesteps)
 else:
     # Use shared training_loop for off-policy algorithms (DDPG)
     training_loop(env, model, action_function, Preprocessor, timesteps=args.timesteps)
 
+## Save the model
+checkpoint_dir = "checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+checkpoint_path = os.path.join(checkpoint_dir, f"{args.alg}_{args.timesteps}_{timestamp}.pt")
+
+# Save the full model state dict
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'algorithm': args.alg,
+    'timesteps': args.timesteps,
+    'num_envs': args.num_envs,
+    'timestamp': timestamp,
+}, checkpoint_path)
+
+print(f"Model saved to: {checkpoint_path}")
+
 model.switch_to_test_mode()
-# model.eval()
-model.to("cpu")
+# model.eval() - switch_to_test_mode() now handles moving to CPU
 ## Watch
 sai.watch(model, action_function, Preprocessor)
 
